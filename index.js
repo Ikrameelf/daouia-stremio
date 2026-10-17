@@ -5,7 +5,7 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 global.SCRAPER_SETTINGS = global.SCRAPER_SETTINGS || {};
 
 // Providers actifs (noms des fichiers dans le repo de Gowaru)
-const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime'];
+   const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime', 'movix'];
 
 const BASE = 'https://raw.githubusercontent.com/Gowaru/gowaru-nuvio-providers/refs/heads/main/providers/';
 
