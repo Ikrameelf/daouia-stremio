@@ -5,7 +5,7 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 global.SCRAPER_SETTINGS = global.SCRAPER_SETTINGS || {};
 
 // Providers actifs (noms des fichiers dans le repo de Gowaru)
-   const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime', 'movix'];
+const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime'];
 
 const BASE = 'https://raw.githubusercontent.com/Gowaru/gowaru-nuvio-providers/refs/heads/main/providers/';
 
@@ -39,7 +39,7 @@ async function loadProviders() {
 
 const builder = new addonBuilder({
   id: 'community.fr-providers',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'FR Providers',
   description: 'Webflix, Flemmix, FrenchStream, VoirAnime',
   resources: ['stream'],
@@ -78,17 +78,39 @@ function runProvider(p, key, args) {
   return promise;
 }
 
-const soft = (promise, ms) =>
-  Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), ms))]);
-
-// Pour chaque provider : un tableau (terminé) ou null (encore en cours)
-function runProviders(tmdbId, mediaType, season, episode, ms = 22000) {
+// Rend la main dès qu'un provider a des flux (+ un délai de grâce pour les autres),
+// ou au bout de "max" ms. Pour chaque provider : un tableau (terminé) ou null (en cours).
+function runProviders(tmdbId, mediaType, season, episode, opts = {}) {
+  const max = opts.max || 20000;
+  const grace = opts.grace || 2500;
   const key = `${mediaType}:${tmdbId}:${season}:${episode}`;
-  return Promise.all(
-    providers.map(p =>
-      soft(runProvider(p, key, [String(tmdbId), mediaType, season, episode]), ms)
-    )
-  );
+  const results = new Array(providers.length).fill(null);
+
+  return new Promise(resolve => {
+    let finished = false;
+    let graceTimer = null;
+    let remaining = providers.length;
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(hardTimer);
+      clearTimeout(graceTimer);
+      resolve(results);
+    };
+    const hardTimer = setTimeout(finish, max);
+
+    if (!providers.length) return finish();
+
+    providers.forEach((p, i) => {
+      runProvider(p, key, [String(tmdbId), mediaType, season, episode]).then(list => {
+        results[i] = list;
+        remaining--;
+        if (list.length && !graceTimer) graceTimer = setTimeout(finish, grace);
+        if (remaining === 0) finish();
+      });
+    });
+  });
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -130,7 +152,8 @@ const app = express();
 app.get('/debug/:mediaType/:tmdbId/:season?/:episode?', async (req, res) => {
   const { mediaType, tmdbId, season, episode } = req.params;
   const results = await runProviders(
-    tmdbId, mediaType, season ? +season : null, episode ? +episode : null, 90000
+    tmdbId, mediaType, season ? +season : null, episode ? +episode : null,
+    { max: 90000, grace: 90000 }
   );
   res.json(results.map((list, i) => ({
     provider: providers[i].id,
