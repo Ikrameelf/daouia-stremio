@@ -1,4 +1,7 @@
-const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const express = require('express');
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
+
+global.SCRAPER_SETTINGS = global.SCRAPER_SETTINGS || {};
 
 const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime'];
 
@@ -35,15 +38,19 @@ async function toTmdb(imdb, type) {
 const timeout = (p, ms) =>
   Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 
+function runProviders(tmdbId, mediaType, season, episode) {
+  return Promise.allSettled(
+    providers.map(p => timeout(Promise.resolve(p.fn(String(tmdbId), mediaType, season, episode)), 25000))
+  );
+}
+
 builder.defineStreamHandler(async ({ type, id }) => {
   const [imdb, s, e] = id.split(':');
   const tmdbId = await toTmdb(imdb, type);
   if (!tmdbId) return { streams: [] };
   const mediaType = type === 'movie' ? 'movie' : 'tv';
 
-  const results = await Promise.allSettled(
-    providers.map(p => timeout(Promise.resolve(p.fn(tmdbId, mediaType, s ? +s : undefined, e ? +e : undefined)), 20000))
-  );
+  const results = await runProviders(tmdbId, mediaType, s ? +s : null, e ? +e : null);
 
   const streams = [];
   results.forEach((r, i) => {
@@ -54,8 +61,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
     for (const st of Array.isArray(r.value) ? r.value : []) {
       if (!st || !st.url) continue;
       streams.push({
-        name: `${providers[i].id}${st.name ? ' · ' + st.name : ''}`,
-        title: st.title || st.quality || '',
+        name: providers[i].id,
+        title: [st.name, st.title || st.quality].filter(Boolean).join('\n'),
         url: st.url,
         behaviorHints: {
           notWebReady: true,
@@ -67,4 +74,23 @@ builder.defineStreamHandler(async ({ type, id }) => {
   return { streams };
 });
 
-serveHTTP(builder.getInterface(), { port: process.env.PORT || 7000 });
+const app = express();
+
+// Debug depuis le navigateur :
+//   /debug/movie/550            -> film (TMDB 550)
+//   /debug/tv/1399/1/1          -> série TMDB 1399, S1E1
+app.get('/debug/:mediaType/:tmdbId/:season?/:episode?', async (req, res) => {
+  const { mediaType, tmdbId, season, episode } = req.params;
+  const results = await runProviders(tmdbId, mediaType, season ? +season : null, episode ? +episode : null);
+  res.json(results.map((r, i) => ({
+    provider: providers[i].id,
+    status: r.status,
+    count: r.status === 'fulfilled' && Array.isArray(r.value) ? r.value.length : 0,
+    error: r.status === 'rejected' ? String(r.reason && r.reason.message) : undefined,
+    sample: r.status === 'fulfilled' && Array.isArray(r.value) ? r.value.slice(0, 2) : undefined
+  })));
+});
+
+app.get('/', (_, res) => res.redirect('/manifest.json'));
+app.use(getRouter(builder.getInterface()));
+app.listen(process.env.PORT || 7000, () => console.log('addon prêt'));
