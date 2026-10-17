@@ -1,26 +1,45 @@
+const fs = require('fs');
 const express = require('express');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 global.SCRAPER_SETTINGS = global.SCRAPER_SETTINGS || {};
 
+// Providers actifs (noms des fichiers dans le repo de Gowaru)
 const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime'];
 
+const BASE = 'https://raw.githubusercontent.com/Gowaru/gowaru-nuvio-providers/refs/heads/main/providers/';
+
 const providers = [];
-for (const id of ENABLED) {
-  try {
-    delete global.getStreams;
-    const m = require(`./providers/${id}.js`);
-    const fn = m.getStreams || (m.default && m.default.getStreams) || global.getStreams;
-    if (typeof fn === 'function') providers.push({ id, fn });
-    else console.error(`[${id}] getStreams introuvable`);
-  } catch (err) {
-    console.error(`[${id}] chargement impossible:`, err.message);
+
+async function loadProviders() {
+  fs.mkdirSync('./providers', { recursive: true });
+  for (const id of ENABLED) {
+    const path = `./providers/${id}.js`;
+    try {
+      try {
+        const r = await fetch(`${BASE}${id}.js`);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        fs.writeFileSync(path, await r.text());
+      } catch (err) {
+        // Si le téléchargement échoue, on utilise la copie locale si elle existe
+        if (!fs.existsSync(path)) throw err;
+        console.error(`[${id}] téléchargement échoué (${err.message}), copie locale utilisée`);
+      }
+
+      delete global.getStreams;
+      const m = require(path);
+      const fn = m.getStreams || (m.default && m.default.getStreams) || global.getStreams;
+      if (typeof fn === 'function') providers.push({ id, fn });
+      else console.error(`[${id}] getStreams introuvable`);
+    } catch (err) {
+      console.error(`[${id}] échec:`, err.message);
+    }
   }
 }
 
 const builder = new addonBuilder({
   id: 'community.fr-providers',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'FR Providers',
   description: 'Webflix, Flemmix, FrenchStream, VoirAnime',
   resources: ['stream'],
@@ -29,18 +48,46 @@ const builder = new addonBuilder({
   catalogs: []
 });
 
+// IMDb -> TMDB
 async function toTmdb(imdb, type) {
   const url = `https://api.themoviedb.org/3/find/${imdb}?external_source=imdb_id&api_key=${process.env.TMDB_KEY}`;
   const j = await (await fetch(url)).json();
   return (type === 'movie' ? j.movie_results : j.tv_results)?.[0]?.id;
 }
 
-const timeout = (p, ms) =>
-  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+// Cache : un provider lent continue en arrière-plan, son résultat est gardé
+const cache = new Map();
+const TTL = 30 * 60 * 1000;
 
-function runProviders(tmdbId, mediaType, season, episode) {
-  return Promise.allSettled(
-    providers.map(p => timeout(Promise.resolve(p.fn(String(tmdbId), mediaType, season, episode)), 25000))
+function runProvider(p, key, args) {
+  const k = p.id + '|' + key;
+  const hit = cache.get(k);
+  if (hit && Date.now() - hit.t < TTL) return hit.promise;
+
+  const promise = Promise.resolve()
+    .then(() => p.fn(...args))
+    .then(v => (Array.isArray(v) ? v : []))
+    .catch(e => {
+      console.error(`[${p.id}]`, e && e.message);
+      return [];
+    });
+
+  cache.set(k, { t: Date.now(), promise });
+  // Un résultat vide n'est pas gardé en cache
+  promise.then(v => { if (!v.length) cache.delete(k); });
+  return promise;
+}
+
+const soft = (promise, ms) =>
+  Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), ms))]);
+
+// Pour chaque provider : un tableau (terminé) ou null (encore en cours)
+function runProviders(tmdbId, mediaType, season, episode, ms = 22000) {
+  const key = `${mediaType}:${tmdbId}:${season}:${episode}`;
+  return Promise.all(
+    providers.map(p =>
+      soft(runProvider(p, key, [String(tmdbId), mediaType, season, episode]), ms)
+    )
   );
 }
 
@@ -53,12 +100,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
   const results = await runProviders(tmdbId, mediaType, s ? +s : null, e ? +e : null);
 
   const streams = [];
-  results.forEach((r, i) => {
-    if (r.status !== 'fulfilled') {
-      console.error(`[${providers[i].id}]`, r.reason && r.reason.message);
-      return;
-    }
-    for (const st of Array.isArray(r.value) ? r.value : []) {
+  let pending = false;
+
+  results.forEach((list, i) => {
+    if (list === null) { pending = true; return; }
+    for (const st of list) {
       if (!st || !st.url) continue;
       streams.push({
         name: providers[i].id,
@@ -71,26 +117,33 @@ builder.defineStreamHandler(async ({ type, id }) => {
       });
     }
   });
-  return { streams };
+
+  // Si un provider est encore en cours, Stremio redemandera vite
+  return { streams, cacheMaxAge: pending ? 30 : 1800 };
 });
 
 const app = express();
 
 // Debug depuis le navigateur :
-//   /debug/movie/550            -> film (TMDB 550)
-//   /debug/tv/1399/1/1          -> série TMDB 1399, S1E1
+//   /debug/movie/550          -> film (TMDB 550)
+//   /debug/tv/1399/1/1        -> série TMDB 1399, S1E1
 app.get('/debug/:mediaType/:tmdbId/:season?/:episode?', async (req, res) => {
   const { mediaType, tmdbId, season, episode } = req.params;
-  const results = await runProviders(tmdbId, mediaType, season ? +season : null, episode ? +episode : null);
-  res.json(results.map((r, i) => ({
+  const results = await runProviders(
+    tmdbId, mediaType, season ? +season : null, episode ? +episode : null, 90000
+  );
+  res.json(results.map((list, i) => ({
     provider: providers[i].id,
-    status: r.status,
-    count: r.status === 'fulfilled' && Array.isArray(r.value) ? r.value.length : 0,
-    error: r.status === 'rejected' ? String(r.reason && r.reason.message) : undefined,
-    sample: r.status === 'fulfilled' && Array.isArray(r.value) ? r.value.slice(0, 2) : undefined
+    status: list === null ? 'pending' : 'done',
+    count: list ? list.length : 0,
+    sample: list ? list.slice(0, 2) : undefined
   })));
 });
 
 app.get('/', (_, res) => res.redirect('/manifest.json'));
 app.use(getRouter(builder.getInterface()));
-app.listen(process.env.PORT || 7000, () => console.log('addon prêt'));
+
+loadProviders().then(() => {
+  console.log('providers chargés:', providers.map(p => p.id).join(', '));
+  app.listen(process.env.PORT || 7000, () => console.log('addon prêt'));
+});
