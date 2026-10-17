@@ -4,11 +4,35 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 global.SCRAPER_SETTINGS = global.SCRAPER_SETTINGS || {};
 
-// Providers actifs (noms des fichiers dans le repo de Gowaru)
+// --- Relais optionnel pour les sites qui bloquent l'IP de Render ---
+const PROXY_URL = (process.env.PROXY_URL || '').replace(/\/+$/, '');
+const PROXY_KEY = process.env.PROXY_KEY || '';
+const PROXIED_HOSTS = (process.env.PROXIED_HOSTS || 'french-stream.net,french-stream.one,flemmix.me')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
+
+const realFetch = global.fetch.bind(global);
+
+function hostMatches(url, list) {
+  try {
+    const h = new URL(url).hostname;
+    return list.some(d => h === d || h.endsWith('.' + d));
+  } catch { return false; }
+}
+const viaProxy = url => !!PROXY_URL && hostMatches(url, PROXIED_HOSTS);
+
+global.fetch = (input, init) => {
+  const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+  if (!viaProxy(url)) return realFetch(input, init);
+  return realFetch(
+    `${PROXY_URL}/?key=${encodeURIComponent(PROXY_KEY)}&url=${encodeURIComponent(url)}`,
+    init
+  );
+};
+
+// --- Providers ---
 const ENABLED = ['webflix', 'flemmix', 'frenchstream', 'voiranime'];
-
 const BASE = 'https://raw.githubusercontent.com/Gowaru/gowaru-nuvio-providers/refs/heads/main/providers/';
-
 const providers = [];
 
 async function loadProviders() {
@@ -17,11 +41,10 @@ async function loadProviders() {
     const path = `./providers/${id}.js`;
     try {
       try {
-        const r = await fetch(`${BASE}${id}.js`);
+        const r = await realFetch(`${BASE}${id}.js`);
         if (!r.ok) throw new Error('HTTP ' + r.status);
         fs.writeFileSync(path, await r.text());
       } catch (err) {
-        // Si le téléchargement échoue, on utilise la copie locale si elle existe
         if (!fs.existsSync(path)) throw err;
         console.error(`[${id}] téléchargement échoué (${err.message}), copie locale utilisée`);
       }
@@ -39,7 +62,7 @@ async function loadProviders() {
 
 const builder = new addonBuilder({
   id: 'community.fr-providers',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'FR Providers',
   description: 'Webflix, Flemmix, FrenchStream, VoirAnime',
   resources: ['stream'],
@@ -51,7 +74,7 @@ const builder = new addonBuilder({
 // IMDb -> TMDB
 async function toTmdb(imdb, type) {
   const url = `https://api.themoviedb.org/3/find/${imdb}?external_source=imdb_id&api_key=${process.env.TMDB_KEY}`;
-  const j = await (await fetch(url)).json();
+  const j = await (await realFetch(url)).json();
   return (type === 'movie' ? j.movie_results : j.tv_results)?.[0]?.id;
 }
 
@@ -73,13 +96,11 @@ function runProvider(p, key, args) {
     });
 
   cache.set(k, { t: Date.now(), promise });
-  // Un résultat vide n'est pas gardé en cache
   promise.then(v => { if (!v.length) cache.delete(k); });
   return promise;
 }
 
-// Rend la main dès qu'un provider a des flux (+ un délai de grâce pour les autres),
-// ou au bout de "max" ms. Pour chaque provider : un tableau (terminé) ou null (en cours).
+// Rend la main dès qu'un provider a des flux (+ délai de grâce), ou au bout de "max" ms.
 function runProviders(tmdbId, mediaType, season, episode, opts = {}) {
   const max = opts.max || 20000;
   const grace = opts.grace || 2500;
@@ -140,13 +161,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
   });
 
-  // Si un provider est encore en cours, Stremio redemandera vite
   return { streams, cacheMaxAge: pending ? 30 : 1800 };
 });
 
 const app = express();
 
-// Debug depuis le navigateur :
+// Debug des providers :
 //   /debug/movie/550          -> film (TMDB 550)
 //   /debug/tv/1399/1/1        -> série TMDB 1399, S1E1
 app.get('/debug/:mediaType/:tmdbId/:season?/:episode?', async (req, res) => {
@@ -161,6 +181,31 @@ app.get('/debug/:mediaType/:tmdbId/:season?/:episode?', async (req, res) => {
     count: list ? list.length : 0,
     sample: list ? list.slice(0, 2) : undefined
   })));
+});
+
+// Ce que reçoit le serveur depuis un site (domaines autorisés seulement) :
+//   /probe?url=https://french-stream.net/            -> via le relais s'il est configuré
+//   /probe?url=https://french-stream.net/&direct=1   -> directement depuis Render
+app.get('/probe', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!hostMatches(url, [...PROXIED_HOSTS, 'webflix.art'])) {
+    return res.status(403).send('domaine non autorisé');
+  }
+  try {
+    const direct = !!req.query.direct;
+    const f = direct ? realFetch : global.fetch;
+    const r = await f(url, { headers: { 'User-Agent': UA, Accept: 'text/html,application/json' } });
+    const body = await r.text();
+    res.json({
+      status: r.status,
+      via: direct ? 'direct' : (viaProxy(url) ? 'relais' : 'direct'),
+      contentType: r.headers.get('content-type'),
+      protection: /just a moment|cf-chl|attention required|ddos-guard/i.test(body),
+      debut: body.slice(0, 300)
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 app.get('/', (_, res) => res.redirect('/manifest.json'));
